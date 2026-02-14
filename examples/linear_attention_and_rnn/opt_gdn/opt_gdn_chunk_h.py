@@ -11,10 +11,10 @@ Calculate the chunk-by-chunk hidden state
 
 pass_configs = {
 	tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
-	tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: False,
+	tilelang.PassConfigKey.TL_ASCEND_AUTO_SYNC: True,
 }
 
-@tilelang.jit(out_idx=[-2, -1], workspace_idx=[-7, -6, -4], pass_configs=pass_configs)
+@tilelang.jit(out_idx=[-2, -1], target = "pto", workspace_idx=[-7, -6, -4], pass_configs=pass_configs)
 def chunk_h_ker(B, H, L, DK, DV, C, BK = None, BV = None, dtype="float16", accum_dtype="float"):
 	if BK == None:
 		BK = DK
@@ -172,6 +172,7 @@ def chunk_h(k, w, u, g, C):
 	workspace_3 = torch.zeros((B * H * bv_num, DK, BV)).npu().to(torch.float16)
 	s = torch.zeros((B, H, (L + C - 1) // C, DK, DV)).npu().to(torch.float16)
 	ker = chunk_h_ker(B, H, L, DK, DV, C)
+	print(ker.get_kernel_source())
 	new_v, final_s = ker(k, w, u, g, workspace_3, s)
 	return s, new_v, final_s
 

@@ -1,0 +1,140 @@
+{
+    "binFileName": "Cast_9f288b80370c6545ffe8cef142d37f5c_high_performance",
+    "binFileSuffix": ".o",
+    "blockDim": -1,
+    "compileInfo": {
+        "_base_info": {
+            "100": [
+                48,
+                4,
+                24568,
+                12280
+            ]
+        },
+        "_custom_vars": {
+            "210000000": [],
+            "210010000": [],
+            "2147483647": []
+        },
+        "_elewise_disable_fuse": false,
+        "_elewise_vars": {
+            "210000000": [
+                10000,
+                20000,
+                30000
+            ],
+            "210010000": [
+                10000,
+                20000,
+                30000
+            ]
+        },
+        "_enable_fractal_format": false,
+        "_enable_vector_core": false,
+        "_inputs_ele_in_block": [
+            16
+        ],
+        "_int64_mode": true,
+        "_is_const_shapes": false,
+        "_is_pure_elewise": true,
+        "_max_out_dtype_num": 16,
+        "_normal_vars": {
+            "210000000": [
+                "_dim_0_0",
+                "_block_factor_0",
+                "_ub_factor_0"
+            ],
+            "210010000": [
+                "_dim_0_0",
+                "_block_factor_0",
+                "_ub_factor_0"
+            ],
+            "2147483647": []
+        },
+        "_pattern": "ElemWise",
+        "_ub_block_size": 32,
+        "_ub_factor_align": 128,
+        "_vars": {
+            "210000000": [
+                "_dim_0_0",
+                "_block_factor_0",
+                "_ub_factor_0"
+            ],
+            "210010000": [
+                "_dim_0_0",
+                "_block_factor_0",
+                "_ub_factor_0"
+            ],
+            "2147483647": []
+        }
+    },
+    "coreType": "VectorCore",
+    "deterministic": "ignore",
+    "intercoreSync": 0,
+    "kernelList": [
+        {
+            "deterministic": "ignore",
+            "kernelName": "Cast_9f288b80370c6545ffe8cef142d37f5c_high_performance_2147483647"
+        },
+        {
+            "deterministic": "ignore",
+            "kernelName": "Cast_9f288b80370c6545ffe8cef142d37f5c_high_performance_210000000"
+        },
+        {
+            "deterministic": "ignore",
+            "kernelName": "Cast_9f288b80370c6545ffe8cef142d37f5c_high_performance_210010000"
+        }
+    ],
+    "kernelName": "Cast_9f288b80370c6545ffe8cef142d37f5c_high_performance",
+    "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+    "memoryStamping": [],
+    "opParaSize": 32,
+    "parameters": [
+        null,
+        null,
+        null
+    ],
+    "sha256": "a882160a5ef19377980900155a25255b8e0ef9f5386216c1e27deae67c375cf5",
+    "supportInfo": {
+        "int64Mode": false,
+        "simplifiedKeyMode": 0,
+        "simplifiedKey": [
+            "Cast/d=0,p=0/0,2/27,2",
+            "Cast/d=1,p=0/0,2/27,2"
+        ],
+        "staticKey": "bc888e216e11ee204ef2f103df7cc8866df2188e7f6ea51e736f6af9a7d197d4",
+        "inputs": [
+            {
+                "name": "x",
+                "index": 0,
+                "dtype": "float32",
+                "format": "ND",
+                "paramType": "required",
+                "shape": [
+                    -2
+                ]
+            }
+        ],
+        "outputs": [
+            {
+                "name": "y",
+                "index": 0,
+                "dtype": "bfloat16",
+                "format": "ND",
+                "paramType": "required",
+                "shape": [
+                    -2
+                ]
+            }
+        ],
+        "attrs": [
+            {
+                "name": "dst_type",
+                "dtype": "int",
+                "value": null
+            }
+        ],
+        "opMode": "dynamic",
+        "deterministic": "ignore"
+    }
+}

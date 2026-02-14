@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git submodule status:*)",
+      "Bash(git submodule:*)",
+      "Bash(git config:*)",
+      "Bash(git clone:*)",
+      "Bash(pip show:*)",
+      "Bash(grep:*)",
+      "Bash(python:*)",
+      "Bash(./build_pto.sh:*)"
+    ]
+  }
+}

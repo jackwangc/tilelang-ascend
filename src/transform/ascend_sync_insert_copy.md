@@ -1,3 +1,4 @@
+```c++
 // Copyright (c) Tile-AI Corporation.
 // Licensed under the MIT License.
 
@@ -268,6 +269,8 @@ private:
     }
 
     Stmt VisitStmt_(const ForNode* op) override {
+      static int loop_counter = 0;
+
       LoopInfo info;
       info.loop_var = op->loop_var;
       info.min = op->min;
@@ -275,7 +278,6 @@ private:
       info.kind = op->kind;
       info.annotations = op->annotations;
 
-      static int loop_counter = 0;
       info.loop_id = "loop_" + std::to_string(loop_counter++);
       info.depth = current_depth_;
       loop_infos_.push_back(info);
@@ -315,7 +317,8 @@ private:
 
     Stmt VisitStmt_(const SeqStmtNode* op) override {
       std::vector<Stmt> new_stmts;
-      for (const Stmt& stmt : op->seq) {
+      for (size_t i = 0; i < op->seq.size(); i++) {
+        const Stmt& stmt = op->seq[i];
         new_stmts.push_back(VisitStmt(stmt));
       }
       if (new_stmts.empty()) {
@@ -362,9 +365,7 @@ private:
           }
 
           if (target_info) {
-            Stmt processed_body = VisitStmt(op->body);
-
-            Stmt merged_body = MergeIterations(processed_body, target_info->loop_id);
+            Stmt merged_body = MergeAndRebuildNested(op->body, target_info->loop_id);
             return For(target_info->loop_var, target_info->min, target_info->extent,
                       target_info->kind, merged_body, NullOpt, target_info->annotations);
           }
@@ -377,7 +378,8 @@ private:
 
     Stmt VisitStmt_(const SeqStmtNode* op) override {
       std::vector<Stmt> new_stmts;
-      for (const Stmt& stmt : op->seq) {
+      for (size_t i = 0; i < op->seq.size(); i++) {
+        const Stmt& stmt = op->seq[i];
         new_stmts.push_back(VisitStmt(stmt));
       }
       if (new_stmts.empty()) {
@@ -399,18 +401,27 @@ private:
   private:
     std::vector<LoopInfo> loop_infos_;
 
+    // 先递归处理嵌套的 unrolled_loop，然后再合并当前循环
+    Stmt MergeAndRebuildNested(const Stmt& unrolled_body, const std::string& loop_id) {
+      // 先递归处理 body 中的嵌套 unrolled_loop
+      Stmt preprocessed = VisitStmt(unrolled_body);
+      // 然后合并当前循环的迭代
+      return MergeIterations(preprocessed, loop_id);
+    }
+
     Stmt MergeIterations(const Stmt& unrolled_body, const std::string& loop_id) {
       std::vector<Stmt> all_stmts = FlattenStmts(unrolled_body);
       if (all_stmts.empty()) {
         return Evaluate(0);
       }
 
-      std::vector<Stmt> iter1_stmts, iter2_stmts;
+      std::vector<Stmt> iter1_stmts, iter2_stmts, outside_stmts;
       bool in_iter1 = false;
       bool in_iter2 = false;
       std::string current_iter;
 
-      for (const auto& stmt : all_stmts) {
+      for (size_t i = 0; i < all_stmts.size(); i++) {
+        const auto& stmt = all_stmts[i];
         if (IsEmptyEvaluate(stmt)) {
           continue;
         }
@@ -439,18 +450,27 @@ private:
           continue;
         }
 
+        std::string stmt_type = stmt->GetTypeKey();
         if (in_iter1) {
           iter1_stmts.push_back(stmt);
         } else if (in_iter2) {
           iter2_stmts.push_back(stmt);
+        } else {
+          outside_stmts.push_back(stmt);
         }
       }
 
-      if (iter1_stmts.empty() && iter2_stmts.empty()) {
+      if (iter1_stmts.empty() && iter2_stmts.empty() && outside_stmts.empty()) {
         return Evaluate(0);
       }
 
+      // 合并两个迭代的语句
       std::vector<Stmt> merged_stmts = MergeStatementSequences(iter1_stmts, iter2_stmts, loop_id);
+
+      // 将 outside_stmts 插入到合并后的语句之前
+      if (!outside_stmts.empty()) {
+        merged_stmts.insert(merged_stmts.begin(), outside_stmts.begin(), outside_stmts.end());
+      }
 
       if (merged_stmts.empty()) {
         return Evaluate(0);
@@ -517,8 +537,10 @@ private:
       std::vector<Stmt> exec_stmts;
       std::vector<std::vector<Stmt>> syncs_before_execs;
 
+      // Phase 1: Process iter1 to extract exec stmts and their syncs
       std::vector<Stmt> current_syncs;
-      for (const auto& stmt : iter1_stmts) {
+      for (size_t i = 0; i < iter1_stmts.size(); i++) {
+        const auto& stmt = iter1_stmts[i];
         if (IsSyncStatement(stmt)) {
           current_syncs.push_back(stmt);
         } else if (!IsMarkerStatement(stmt)) {
@@ -533,9 +555,11 @@ private:
         current_syncs.clear();
       }
 
+      // Phase 2: Process iter2 to extract syncs for each exec
       std::vector<std::vector<Stmt>> iter2_syncs_before_execs(exec_stmts.size());
       size_t exec_index = 0;
-      for (const auto& stmt : iter2_stmts) {
+      for (size_t i = 0; i < iter2_stmts.size(); i++) {
+        const auto& stmt = iter2_stmts[i];
         if (IsSyncStatement(stmt)) {
           if (exec_index < iter2_syncs_before_execs.size()) {
             iter2_syncs_before_execs[exec_index].push_back(stmt);
@@ -551,6 +575,7 @@ private:
         iter2_syncs_before_execs.push_back(current_syncs);
       }
 
+      // Phase 3: Merge syncs from both iterations
       std::vector<std::vector<Stmt>> merged_syncs_before_execs;
       for (size_t i = 0; i < syncs_before_execs.size(); i++) {
         std::vector<Stmt> merged_syncs = syncs_before_execs[i];
@@ -564,13 +589,11 @@ private:
         merged_syncs_before_execs.push_back(merged_syncs);
       }
 
+      // Phase 4: Build final merged stmts
       for (size_t i = 0; i < exec_stmts.size(); i++) {
-        std::vector<Stmt> syncs;
+        // 添加合并后的同步语句
         for (const auto& sync : merged_syncs_before_execs[i]) {
-          if (!ContainsSync(syncs, sync)) {
-            syncs.push_back(sync);
-            merged_stmts.push_back(sync);
-          }
+          merged_stmts.push_back(sync);
         }
         merged_stmts.push_back(exec_stmts[i]);
       }
@@ -600,9 +623,10 @@ private:
             auto func_name_imm = call->args[0].as<StringImmNode>();
             if (func_name_imm) {
               std::string func_name = func_name_imm->value;
-              return ((func_name.find("AutoBarrier") != std::string::npos ||
+              bool is_sync = ((func_name.find("AutoBarrier") != std::string::npos ||
                        func_name.find("AutoSetFlag") != std::string::npos ||
                        func_name.find("AutoWaitFlag") != std::string::npos));
+              return is_sync;
             }
           } else if (call->op.same_as(tl::ascend_auto_barrier())  ||
                      call->op.same_as(tl::ascend_auto_set_flag()) ||
@@ -767,12 +791,11 @@ private:
         result_.push_back(GetRef<Stmt>(op));
         VisitStmt(op->body);
       }
+
       void VisitStmt_(const BufferStoreNode* op) override {
-        result_.push_back(Evaluate(Call(DataType::Handle(),
-                                        Op::Get("tl.ascend_auto_barrier"),
-                                        {StringImm("PIPE_ALL")})));
         result_.push_back(GetRef<Stmt>(op));
       }
+
     private:
       std::vector<Stmt>& result_;
     };
@@ -1444,3 +1467,4 @@ TVM_REGISTER_GLOBAL("tl.transform.AscendSyncInsert")
 
 }  // namespace tl
 }  // namespace tvm
+```
