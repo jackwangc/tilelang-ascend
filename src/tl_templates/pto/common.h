@@ -1,5 +1,6 @@
 #include <pto/pto-inst.hpp>
 
+#ifdef __CCE_AICORE__
 #define CUDART_INF_F 1.0f / 0.0f
 
 namespace tl::ascend_pto {
@@ -37,16 +38,25 @@ template <typename T, int32_t shape>
 AICORE PTO_INLINE void mov_tile(int32_t src_addr,
                 int32_t dst_addr, int32_t src_offset, int32_t dst_offset, int32_t len) {
     // TileUbDataND<float, 1, shape> src_temp_ub(1, shape);
-    TileUbDataND<float, 1, shape, 1, shape> src_temp_ub;
+    TileUbDataND<T, 1, shape, 1, shape> src_temp_ub;
     pto::TASSIGN(src_temp_ub, src_addr + src_offset * len);
-    TileUbDataND<float, 1, shape, 1, shape> dst_temp_ub;
+    TileUbDataND<T, 1, shape, 1, shape> dst_temp_ub;
     pto::TASSIGN(dst_temp_ub, dst_addr + dst_offset * len);
     pto::TMOV(dst_temp_ub, src_temp_ub);
 }
 
+template <typename T1, typename T2, int32_t shape>
+AICORE PTO_INLINE void cvt_tile(int32_t src_addr,
+                int32_t dst_addr, int32_t src_offset, int32_t dst_offset, int32_t src_len, int32_t dst_len, pto::RoundMode rmode) {
+    TileUbDataND<T1, 1, shape, 1, shape> src_temp_ub;
+    pto::TASSIGN(src_temp_ub, src_addr + src_offset * src_len);
+    TileUbDataND<T2, 1, shape, 1, shape> dst_temp_ub;
+    pto::TASSIGN(dst_temp_ub, dst_addr + dst_offset * dst_len);
+    pto::TCVT(dst_temp_ub, src_temp_ub, rmode);
+}
 
 template <typename T1, typename T2, uint32_t M, uint32_t N, uint32_t K,
-          uint32_t validM = M, uint32_t validN = N, uint32_t validK = K,
+          uint32_t validM = M, uint32_t validN = N, uint32_t validK = K, uint32_t K_tail, 
           bool transpose_A = false, bool transpose_B = false>
 AICORE PTO_INLINE void gemm_v0(
     std::conditional_t<transpose_A,
@@ -57,51 +67,167 @@ AICORE PTO_INLINE void gemm_v0(
         TileMatL1<T1, K, N, validK, validN>>& B,
     pto::TileAcc<T2, M, N, validM, validN>& C,
     bool clear) {
+    constexpr uint32_t kL0Size = 128;          // L0 slice size, adapted to 64K memory limit
+    const uint32_t kL0split = (K + kL0Size - 1) / kL0Size;  // Number of slices
+    bool initflag = false;
 
-    pto::TileLeft<T1, M, K> l0a;
+    pto::TileLeft<T1, M, kL0Size> l0a;
     pto::TASSIGN(l0a, 0x0);
-    pto::TileRight<T1, K, N> l0b;
+    pto::TileRight<T1, kL0Size, N> l0b;
     pto::TASSIGN(l0b, 0x0);
+
     auto war_event_id = (event_t)(((int)EVENT_ID0 + 1) % 8);
+
     set_flag(PIPE_MTE2, PIPE_MTE1, war_event_id);
     wait_flag(PIPE_MTE2, PIPE_MTE1, war_event_id);
+
+    for (uint32_t kL0Idx = 0; kL0Idx < kL0split; kL0Idx++) {
+        initflag = (clear && (kL0Idx == 0));
+        const bool is_tail_block = (kL0Idx == kL0split - 1); // Determine whether it is a tail block
+
+        // Dynamically define the L0 cache size based on whether the tile is an end tile.
+        if (is_tail_block) {
+            pto::TileLeft<T1, M, K_tail> l0a;  
+            pto::TileRight<T1, K_tail, N> l0b;
+            pto::TASSIGN(l0a, 0x0);
+            pto::TASSIGN(l0b, 0x0);
+
+            /**
+            * Added synchronization logic: Write-After-Read (WAR) protection
+            * Objective: Prevent MTE1 (data transfer) from overwriting L0 before M (Cube) completes processing the previous round of data
+            * TODO: Support Ping-Pong buffer.
+            */
+            set_flag(PIPE_M, PIPE_MTE1, war_event_id);
+            wait_flag(PIPE_M, PIPE_MTE1, war_event_id);
+
+            if constexpr (!transpose_A) {
+                pto::TEXTRACT(l0a, A, 0, kL0Idx * K_tail);
+            } else {
+                TileMatL1ZN<T1, M, K, validM, validK> A_t;
+                pto::TRESHAPE(A_t, A);
+                pto::TEXTRACT(l0a, A_t, 0, kL0Idx * K_tail);
+            }
+            if constexpr (!transpose_B) {
+                pto::TEXTRACT(l0b, B, kL0Idx * K_tail, 0);
+            } else {
+                TileMatL1ZN<T1, K, N, validK, validN> B_t;
+                pto::TRESHAPE(B_t, B);
+                pto::TEXTRACT(l0b, B_t, kL0Idx * K_tail, 0);
+            }
+
+            set_flag(PIPE_MTE1, PIPE_M, war_event_id);
+            wait_flag(PIPE_MTE1, PIPE_M, war_event_id);
+
+            if (initflag) {
+                pto::TMATMUL(C, l0a, l0b);
+            } else {
+                pto::TMATMUL_ACC(C, C, l0a, l0b);
+            }
+           
+        } else {
+            // Non-tail block: The L0 cache is defined at the standard size (current_kSize = kL0Size=128).
+            pto::TileLeft<T1, M, kL0Size> l0a; 
+            pto::TileRight<T1, kL0Size, N> l0b;
+            pto::TASSIGN(l0a, 0x0);
+            pto::TASSIGN(l0b, 0x0);
+
+            set_flag(PIPE_M, PIPE_MTE1, war_event_id);
+            wait_flag(PIPE_M, PIPE_MTE1, war_event_id);
+
+            set_flag(PIPE_FIX, PIPE_M, war_event_id);
+            wait_flag(PIPE_FIX, PIPE_M, war_event_id);
+
+            if constexpr (!transpose_A) {
+                pto::TEXTRACT(l0a, A, 0, kL0Idx * kL0Size);
+            } else {
+                TileMatL1ZN<T1, M, K, validM, validK> A_t;
+                pto::TRESHAPE(A_t, A);
+                pto::TEXTRACT(l0a, A_t, 0, kL0Idx * kL0Size);
+            }
+            if constexpr (!transpose_B) {
+                pto::TEXTRACT(l0b, B, kL0Idx * kL0Size, 0);
+            } else {
+                TileMatL1ZN<T1, K, N, validK, validN> B_t;
+                pto::TRESHAPE(B_t, B);
+                pto::TEXTRACT(l0b, B_t, kL0Idx * kL0Size, 0);
+            }
+
+            set_flag(PIPE_MTE1, PIPE_M, war_event_id);
+            wait_flag(PIPE_MTE1, PIPE_M, war_event_id);
+
+            if (initflag) {
+                pto::TMATMUL(C, l0a, l0b);
+            } else {
+                pto::TMATMUL_ACC(C, C, l0a, l0b);
+            }
+
+            set_flag(PIPE_MTE1, PIPE_MTE2, war_event_id);
+            wait_flag(PIPE_MTE1, PIPE_MTE2, war_event_id);
+        }
+    }
+
+    set_flag(PIPE_MTE1, PIPE_MTE2, war_event_id);
+    wait_flag(PIPE_MTE1, PIPE_MTE2, war_event_id);
+
+    set_flag(PIPE_M, PIPE_FIX, war_event_id);
+    wait_flag(PIPE_M, PIPE_FIX, war_event_id);
+}
+
+template <typename T1, typename T2, uint32_t L1_BLOCK_M, uint32_t L1_BLOCK_N, uint32_t L1_BLOCK_K, uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t validL1_BM = L1_BLOCK_M, uint32_t validL1_BN = L1_BLOCK_N, uint32_t validL1_BK = L1_BLOCK_K,
+          uint32_t validBM = BLOCK_M, uint32_t validBN = BLOCK_N, uint32_t validBK = BLOCK_K,
+          bool transpose_A = false, bool transpose_B = false>
+AICORE PTO_INLINE void gemm_v1(
+    std::conditional_t<transpose_A,
+        TileMatL1<T1, L1_BLOCK_K, L1_BLOCK_M, validL1_BK, validL1_BM>,
+        TileMatL1<T1, L1_BLOCK_M, L1_BLOCK_K, validL1_BM, validL1_BK>>& A,
+    std::conditional_t<transpose_B,
+        TileMatL1<T1, BLOCK_N, L1_BLOCK_K, validBN, validL1_BK>,
+        TileMatL1<T1, L1_BLOCK_K, BLOCK_N, validL1_BK, validBN>>& B,
+    pto::TileAcc<T2, BLOCK_M, BLOCK_N, validBM, validBN>& C,
+    bool clear) {
+
+    pto::TileLeft<T1, L1_BLOCK_M, L1_BLOCK_K> l0a;
+    pto::TASSIGN(l0a, 0x0);
+    pto::TileRight<T1, L1_BLOCK_K, BLOCK_N> l0b;
+    pto::TASSIGN(l0b, 0x0);
+
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
 
     /**
      * Added synchronization logic: Write-After-Read (WAR) protection
      * Objective: Prevent MTE1 (data transfer) from overwriting L0 before M (Cube) completes processing the previous round of data
      * TODO: Support Ping-Pong buffer.
     */
+    auto war_event_id = (event_t)((int)EVENT_ID0 + 1);
     set_flag(PIPE_M, PIPE_MTE1, war_event_id);
     wait_flag(PIPE_M, PIPE_MTE1, war_event_id);
 
     if constexpr (!transpose_A) {
         pto::TEXTRACT(l0a, A, 0, 0);
     } else {  // transpose A
-        TileMatL1ZN<T1, M, K, validM, validK> A_t;
+        TileMatL1ZN<T1, L1_BLOCK_M, L1_BLOCK_K, validL1_BM, validL1_BK> A_t;
         pto::TRESHAPE(A_t, A);
         pto::TEXTRACT(l0a, A_t, 0, 0);
     }
     if constexpr (!transpose_B) {
         pto::TEXTRACT(l0b, B, 0, 0);
     } else {  // transpose B
-        TileMatL1ZN<T1, K, N, validK, validN> B_t;
+        TileMatL1ZN<T1, L1_BLOCK_K, BLOCK_N, validL1_BK, validBN> B_t;
         pto::TRESHAPE(B_t, B);
         pto::TEXTRACT(l0b, B_t, 0, 0);
     }
 
-    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+            set_flag(PIPE_MTE1, PIPE_M, war_event_id);
+            wait_flag(PIPE_MTE1, PIPE_M, war_event_id);
 
     if (clear) {
         pto::TMATMUL(C, l0a, l0b);
     } else {
         pto::TMATMUL_ACC(C, C, l0a, l0b);
     }
-
-    set_flag(PIPE_MTE1, PIPE_MTE2, war_event_id);
-    wait_flag(PIPE_MTE1, PIPE_MTE2, war_event_id);
 }
-
 
 template <typename T1, typename T2, int32_t shape1, int32_t shape2, int32_t shape3,
         int32_t shape4, int32_t shape5, int32_t stride1, int32_t stride2,
@@ -131,15 +257,19 @@ AICORE PTO_INLINE void copy_l0c_to_gm_dynamic(
 
 template <typename T1, typename T2, int32_t shape1, int32_t shape2, int32_t shape3,
         int32_t shape4, int32_t shape5, int32_t stride1, int32_t stride2,
-        int32_t stride3, int32_t stride4, int32_t stride5, uint32_t valid1, uint32_t valid2>
+        int32_t stride3, int32_t stride4, int32_t stride5, uint32_t ub_shape1, uint32_t ub_shape2, uint32_t valid1, uint32_t valid2>
 AICORE PTO_INLINE void copy_gm_to_ub_dynamic(
             __gm__ T1 *handle,
             const pto::Shape<shape1, shape2, shape3, shape4, shape5>& shape,
             const pto::Stride<stride1, stride2, stride3, stride4, stride5>& stride,
-            TileUbDataND<T2, shape4, shape5> &ub) {
+            int32_t ub_shape_addr,
+            int32_t ub_offset,
+            int32_t len) {
     pto::GlobalTensor<T1, pto::Shape<shape1, shape2, shape3, shape4, shape5>,
     pto::Stride<stride1, stride2, stride3, stride4, stride5>> global_tensor(handle, shape, stride);
-    pto::TLOAD(ub, global_tensor);
+    TileUbDataND<T2, ub_shape1, ub_shape2, valid1, valid2> temp_ub;
+    pto::TASSIGN(temp_ub, ub_shape_addr + ub_offset * len);
+    pto::TLOAD(temp_ub, global_tensor);
 }
 
 template <typename T1, typename T2, int32_t shape1, int32_t shape2, int32_t shape3,
@@ -182,13 +312,17 @@ AICORE PTO_INLINE void copy_l0c_to_gm(__gm__ T1 *handle, pto::TileAcc<T2, shape4
 
 template <typename T1, typename T2, int32_t shape1, int32_t shape2, int32_t shape3,
         int32_t shape4, int32_t shape5, int32_t stride1, int32_t stride2,
-        int32_t stride3, int32_t stride4, int32_t stride5, uint32_t valid1, uint32_t valid2>
+        int32_t stride3, int32_t stride4, int32_t stride5, uint32_t ub_shape1, uint32_t ub_shape2, uint32_t valid1, uint32_t valid2>
 AICORE PTO_INLINE void copy_gm_to_ub(
             __gm__ T1 *handle,
-            TileUbDataND<T2, shape4, shape5, valid1, valid2> &ub) {
+             int32_t ub_shape_addr,
+            int32_t ub_offset,
+            int32_t len) {
     pto::GlobalTensor<T1, pto::Shape<shape1, shape2, shape3, shape4, shape5>,
     pto::Stride<stride1, stride2, stride3, stride4, stride5>> global_tensor(handle);
-    pto::TLOAD(ub, global_tensor);
+    TileUbDataND<T2, ub_shape1, ub_shape2, valid1, valid2> temp_ub;
+    pto::TASSIGN(temp_ub, ub_shape_addr + ub_offset * len);
+    pto::TLOAD(temp_ub, global_tensor);
 }
 
 template <typename T1, typename T2, int32_t shape1, int32_t shape2, int32_t shape3,
@@ -442,23 +576,25 @@ enum class BinaryOps {
     TMINS
 };
 
-template <BinaryOps Op, typename T, int32_t shape>
-AICORE PTO_INLINE void binarys_tile(int32_t addr,
-                int32_t offset, int32_t len, T scalar_value) {
-    TileUbDataND<T, 1, shape, 1, shape> temp_ub;
-    pto::TASSIGN(temp_ub, addr + offset * len);
+template <BinaryOps Op, typename T, int32_t dst_shape, int32_t src_shape>
+AICORE PTO_INLINE void binarys_tile(int32_t dst_addr, int32_t src_addr,
+                int32_t dst_offset, int32_t src_offset, int32_t len, T scalar_value) {
+    TileUbDataND<T, 1, dst_shape, 1, dst_shape> dst_temp_ub;
+    pto::TASSIGN(dst_temp_ub, dst_addr + dst_offset * len);
+    TileUbDataND<T, 1, src_shape, 1, src_shape> src_temp_ub;
+    pto::TASSIGN(src_temp_ub, src_addr + src_offset * len);
     if constexpr (Op == BinaryOps::TADDS) {
-        pto::TADDS(temp_ub, temp_ub, scalar_value);
+        pto::TADDS(dst_temp_ub, src_temp_ub, scalar_value);
     } else if constexpr (Op == BinaryOps::TSUBS) {
-        pto::TSUBS(temp_ub, temp_ub, scalar_value);
+        pto::TSUBS(dst_temp_ub, src_temp_ub, scalar_value);
     } else if constexpr (Op == BinaryOps::TMULS) {
-        pto::TMULS(temp_ub, temp_ub, scalar_value);
+        pto::TMULS(dst_temp_ub, src_temp_ub, scalar_value);
     } else if constexpr (Op == BinaryOps::TDIVS) {
-        pto::TDIVS(temp_ub, temp_ub, scalar_value);
+        pto::TDIVS(dst_temp_ub, src_temp_ub, scalar_value);
     } else if constexpr (Op == BinaryOps::TMAXS) {
-        pto::TMAXS(temp_ub, temp_ub, scalar_value);
+        pto::TMAXS(dst_temp_ub, src_temp_ub, scalar_value);
     } else if constexpr (Op == BinaryOps::TMINS) {
-        pto::TMINS(temp_ub, temp_ub, scalar_value);
+        pto::TMINS(dst_temp_ub, src_temp_ub, scalar_value);
     }
 }
 
@@ -505,4 +641,36 @@ AICORE PTO_INLINE void TROWEXPAND_with_slice_buffer(
 
   pto::TROWEXPAND(dst, src_temp_ub);
 }
+template<pipe_t pipe> 
+AICORE PTO_INLINE void set_cross_flag(int32_t flag, int32_t mode) {
+    int config = 1 | (mode << 4) | (flag << 8);
+    ffts_cross_core_sync(pipe, config);
 }
+
+template<pipe_t pipe> 
+AICORE PTO_INLINE void set_intra_block_cube(int32_t flag) {
+    set_intra_block(pipe, flag);
+    set_intra_block(pipe, flag + 16);
+}
+
+template<pipe_t pipe> 
+AICORE PTO_INLINE void set_intra_block_vec(int32_t flag) {
+    set_intra_block(pipe, flag);
+}
+
+AICORE PTO_INLINE void wait_cross_flag(int32_t flag) {
+    wait_flag_dev(flag);
+}
+
+template<pipe_t pipe> 
+AICORE PTO_INLINE void wait_intra_block_cube(int32_t flag) {
+    wait_intra_block(pipe, flag);
+    wait_intra_block(pipe, flag + 16);
+}
+
+template<pipe_t pipe> 
+AICORE PTO_INLINE void wait_intra_block_vec(int32_t flag) {
+    wait_intra_block(pipe, flag);
+}
+}
+#endif
